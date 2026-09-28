@@ -269,6 +269,14 @@ services:
 > bound on the Docker host, while clients on the shared network still reach the sidecar by
 > container name on 5432.
 
+With persistent or hybrid storage, a server read after an emulator restart reconnects the
+saved resource to its existing PostgreSQL sidecar and reports the current endpoint. New
+servers use a stable Docker volume for database files, so a missing sidecar can be
+recreated with the same data. Older servers that use an anonymous Docker volume can be
+recovered while their sidecar still exists; keep that container and its volume until its
+data has been migrated or backed up. If neither a sidecar nor a managed volume exists,
+floci-az leaves the resource unavailable instead of starting an empty database.
+
 ---
 
 ## Architecture

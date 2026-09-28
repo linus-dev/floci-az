@@ -84,6 +84,27 @@ docker run -d --name floci-az \
 
 All services are available at `http://localhost:4577`. Use any account name and key: in `dev` auth mode credentials are not validated.
 
+### Using this Compose file with Floci UI
+
+The checked-in `docker-compose.yml` builds Floci AZ from this checkout and joins the
+shared `floci_default` network. It uses hybrid storage and, by default, reads the
+existing state from `../floci-ui/data/floci-az`. Keep that directory in place when
+moving Floci AZ out of the Floci UI Compose project. Set `FLOCI_AZ_DATA_DIR` to its
+absolute path if your clones are elsewhere. Set `FLOCI_AZ_HOSTNAME` if the Pi's
+address differs from the default `192.168.50.170`.
+
+The shared network must already exist. On a fresh Docker host, create it with
+`docker network create floci_default`. Before the first start, remove the old
+Floci AZ container so port 4577 is free. For an existing PostgreSQL server,
+disable the old Floci AZ container's restart policy, force-stop it, and remove
+only that container. The older Floci AZ version removes managed sidecars on
+graceful shutdown. Keep the PostgreSQL sidecar and its Docker volume; do not
+use `docker compose down --volumes`.
+
+Start this Compose project from the Floci AZ checkout with
+`docker compose up -d --build`, and start the Floci UI Compose project
+separately. Both projects use the `floci-az` network name.
+
 > **Azure Functions** requires access to the Docker socket so Floci AZ can spawn runtime containers on demand. Mount `/var/run/docker.sock` as shown above. If you don't use Functions, the socket mount is optional.
 
 <details>

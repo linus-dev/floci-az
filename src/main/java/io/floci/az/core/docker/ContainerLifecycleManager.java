@@ -445,6 +445,11 @@ public class ContainerLifecycleManager {
      * @return information about the adopted container
      */
     public ContainerInfo adopt(String containerId, List<Integer> ports) {
+        return adopt(containerId, ports, null);
+    }
+
+    /** Adopts a container, preferring its address on the supplied Docker network. */
+    public ContainerInfo adopt(String containerId, List<Integer> ports, String preferredNetwork) {
         LOG.infov("Adopting existing container {0}", containerId);
 
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -459,7 +464,7 @@ public class ContainerLifecycleManager {
         Map<Integer, EndpointInfo> endpoints = new HashMap<>();
         Map<Integer, Integer> publishedHostPorts = new HashMap<>();
         for (int port : ports) {
-            endpoints.put(port, resolveEndpoint(inspect, port));
+            endpoints.put(port, resolveEndpoint(inspect, port, preferredNetwork));
             OptionalInt published = readPublishedHostPort(inspect, port);
             if (published.isPresent()) {
                 publishedHostPorts.put(port, published.getAsInt());

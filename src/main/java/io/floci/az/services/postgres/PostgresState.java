@@ -28,7 +28,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>When the emulator restarts with a persistent backend, server ARM metadata is
  * restored from disk. Container runtime state ({@code containerId}, {@code hostPort})
- * is always cleared on load — containers must be restarted on first use.
+ * is always cleared on load — the handler reconnects persisted servers to their
+ * sidecars on first use.
  *
  * <p>Mirrors {@code SqlState}; all public methods are thread-safe via {@code synchronized}.
  */
@@ -267,7 +268,7 @@ public class PostgresState {
             });
         }
         if (!servers.isEmpty()) {
-            LOG.infof("Restored %d PostgreSQL server(s) from storage (containers will restart on next request)",
+            LOG.infof("Restored %d PostgreSQL server(s) from storage (sidecars will recover on next request)",
                 servers.size());
         }
     }
@@ -282,8 +283,8 @@ public class PostgresState {
 
     /**
      * Represents a logical PostgreSQL flexible server (maps 1-to-1 with a Docker container).
-     * <p>{@code containerId} and {@code hostPort} are runtime-only and are never restored
-     * from persistent storage.
+     * <p>{@code containerId}, {@code hostPort}, and {@code host} are runtime-only and are
+     * cleared when a record is loaded from persistent storage.
      */
     @RegisterForReflection
     public record ServerEntry(
@@ -297,9 +298,9 @@ public class PostgresState {
             String skuName,
             String skuTier,
             int storageSizeGB,
-            String containerId,                   // null until container starts; not persisted
-            int hostPort,                         // 0 until container starts; not persisted
-            String host,                          // reachable host: "localhost" or the container name on a shared Docker network; not persisted
+            String containerId,                   // null until container starts; cleared on load
+            int hostPort,                         // 0 until container starts; cleared on load
+            String host,                          // reachable host; cleared on load
             Map<String, String> tags,
             Map<String, DatabaseEntry> databases,
             Map<String, FirewallRule> firewallRules,

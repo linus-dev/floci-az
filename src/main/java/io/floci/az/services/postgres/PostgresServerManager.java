@@ -13,6 +13,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.net.Socket;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,7 +47,7 @@ public class PostgresServerManager {
     @Inject ContainerDetector containerDetector;
     @Inject PortAllocator portAllocator;
 
-    /** containerId → container name, for cleanup on shutdown. */
+    /** containerId → server name, for cleanup on shutdown. */
     private final ConcurrentHashMap<String, String> managedContainers = new ConcurrentHashMap<>();
 
     /** containerId -> the fixed host port claimed for it, so the claim is released with the container. */
@@ -61,11 +62,49 @@ public class PostgresServerManager {
      * @throws RuntimeException if the container fails to start or become ready
      */
     public PostgresState.ServerEntry startServer(PostgresState.ServerEntry entry) {
+        return startServer(entry, false);
+    }
+
+    /** Reconnects a persisted server without discarding an existing data container. */
+    public PostgresState.ServerEntry recoverServer(PostgresState.ServerEntry entry) {
+        String name = containerName(entry.serverName());
+        var existing = containerManager.findByName(name);
+        if (existing.isPresent()) {
+            ContainerLifecycleManager.ContainerInfo info = containerManager.adopt(
+                existing.get().getId(), List.of(PG_CONTAINER_PORT),
+                config.services().dockerNetwork().orElse(null));
+            PostgresState.ServerEntry recovered = withEndpoint(entry, info, name);
+            ContainerLifecycleManager.EndpointInfo endpoint = info.getEndpoint(PG_CONTAINER_PORT);
+            waitForReady(endpoint.host(), endpoint.port(), config.services().postgres().startupTimeoutSeconds());
+            managedContainers.put(info.containerId(), entry.serverName());
+            int configuredPort = config.services().postgres().defaultPort();
+            if (configuredPort > 0 && info.publishedHostPort(PG_CONTAINER_PORT).orElse(0) == configuredPort) {
+                portAllocator.markReserved(configuredPort);
+                claimedPorts.put(info.containerId(), configuredPort);
+            }
+            LOG.infof("Recovered PostgreSQL server %s from container %s", entry.serverName(), info.containerId());
+            return recovered;
+        }
+
+        String volumeName = volumeName(entry.serverName());
+        if (!containerManager.volumeExists(volumeName)) {
+            throw new IllegalStateException("PostgreSQL container for server '" + entry.serverName()
+                + "' is missing and no managed data volume exists; refusing to start an empty database");
+        }
+        return startServer(entry, true);
+    }
+
+    private PostgresState.ServerEntry startServer(PostgresState.ServerEntry entry, boolean recovering) {
         EmulatorConfig.PostgresServiceConfig pgConfig = config.services().postgres();
         String image = pgConfig.image();
 
         String containerName = containerName(entry.serverName());
-        containerManager.removeIfExists(containerName);
+        if (!recovering) {
+            containerManager.removeIfExists(containerName);
+        }
+
+        String volumeName = volumeName(entry.serverName());
+        containerManager.ensureVolume(volumeName);
 
         LOG.infof("Starting PostgreSQL container: server=%s image=%s", entry.serverName(), image);
 
@@ -85,6 +124,8 @@ public class PostgresServerManager {
                 + "to an OS-assigned host port for server=%s", configuredPort, entry.serverName());
         }
 
+        // PostgreSQL 18 moved its default PGDATA outside /var/lib/postgresql/data.
+        // Keep both 17 and 18 data under the same managed parent volume.
         ContainerSpec spec = containerBuilder.newContainer(image)
             .withName(containerName)
             .withPortBinding(PG_CONTAINER_PORT, requestedHostPort)   // 0 = OS picks (default-port unset or unavailable)
@@ -92,6 +133,8 @@ public class PostgresServerManager {
             .withEnv("POSTGRES_USER", entry.administratorLogin())
             .withEnv("POSTGRES_PASSWORD", entry.administratorLoginPassword())
             .withEnv("POSTGRES_DB", "postgres")
+            .withEnv("PGDATA", "/var/lib/postgresql/floci-data")
+            .withNamedVolume(volumeName, "/var/lib/postgresql")
             .withLogRotation()
             .build();
 
@@ -103,25 +146,11 @@ public class PostgresServerManager {
             ContainerLifecycleManager.ContainerInfo info = containerManager.createAndStart(spec);
             String containerId = info.containerId();
 
-            int hostPort = Optional.ofNullable(info.getEndpoint(PG_CONTAINER_PORT))
-                .map(ContainerLifecycleManager.EndpointInfo::port)
-                .orElseThrow(() -> new RuntimeException(
-                    "Could not resolve host port for PostgreSQL container " + containerName));
+            PostgresState.ServerEntry started = withEndpoint(entry, info, containerName);
+            String reachableHost = started.host();
+            int reachablePort = started.hostPort();
 
-            // Pick the address an application can actually reach (mirrors RedisCacheManager):
-            // when floci-az runs inside a container, clients on the shared Docker network reach the
-            // sidecar by its container name on the container port; otherwise via localhost:hostPort.
-            String reachableHost;
-            int reachablePort;
-            if (containerDetector.isRunningInContainer()) {
-                reachableHost = containerName;
-                reachablePort = PG_CONTAINER_PORT;
-            } else {
-                reachableHost = "localhost";
-                reachablePort = hostPort;
-            }
-
-            managedContainers.put(containerId, containerName);
+            managedContainers.put(containerId, entry.serverName());
 
             // Record the port we claimed, not the one Docker reported: only a claimed port is
             // reserved in the allocator, and only that one may be released later.
@@ -145,7 +174,7 @@ public class PostgresServerManager {
             LOG.infof("PostgreSQL server ready: server=%s endpoint=%s:%d",
                 entry.serverName(), reachableHost, reachablePort);
 
-            return entry.withContainer(containerId, reachablePort, reachableHost);
+            return started;
         } finally {
             if (!claimTransferred) {
                 releaseClaimedPort(requestedHostPort);
@@ -153,9 +182,20 @@ public class PostgresServerManager {
         }
     }
 
-    /**
-     * Stops and removes the container associated with the given server entry.
-     */
+    private PostgresState.ServerEntry withEndpoint(PostgresState.ServerEntry entry,
+                                                   ContainerLifecycleManager.ContainerInfo info,
+                                                   String name) {
+        ContainerLifecycleManager.EndpointInfo endpoint = Optional.ofNullable(info.getEndpoint(PG_CONTAINER_PORT))
+            .orElseThrow(() -> new IllegalStateException("Could not resolve PostgreSQL endpoint for " + name));
+        if (endpoint.host() == null || endpoint.host().isBlank() || endpoint.port() <= 0) {
+            throw new IllegalStateException("PostgreSQL endpoint is not usable for " + name);
+        }
+        if (containerDetector.isRunningInContainer()) {
+            return entry.withContainer(info.containerId(), PG_CONTAINER_PORT, name);
+        }
+        return entry.withContainer(info.containerId(), endpoint.port(), "localhost");
+    }
+
     /**
      * Gives a claimed fixed port back so a later create can have it again. Takes the port
      * rather than the containerId on purpose: a start that fails before the container is
@@ -167,19 +207,34 @@ public class PostgresServerManager {
         }
     }
 
+    /** Stops and removes the container associated with the given server entry. */
     public void stopServer(PostgresState.ServerEntry entry) {
-        if (entry.containerId() == null) return;
+        String containerId = entry.containerId();
+        if (containerId == null) {
+            containerId = containerManager.findByName(containerName(entry.serverName()))
+                .map(com.github.dockerjava.api.model.Container::getId)
+                .orElse(null);
+        }
+        if (containerId == null) {
+            if (ContainerStorageHelper.shouldPruneVolume(config)) {
+                containerManager.removeVolume(volumeName(entry.serverName()));
+            }
+            return;
+        }
         LOG.infof("Stopping PostgreSQL container: server=%s containerId=%s",
-            entry.serverName(), entry.containerId());
+            entry.serverName(), containerId);
         // Give the port and the bookkeeping back first: stopAndRemove can throw on a daemon
         // hiccup, every caller swallows that, and the delete path has already dropped the
         // server from state, so nothing would ever retry the release.
-        managedContainers.remove(entry.containerId());
-        Integer claimed = claimedPorts.remove(entry.containerId());
+        managedContainers.remove(containerId);
+        Integer claimed = claimedPorts.remove(containerId);
         if (claimed != null) {
             releaseClaimedPort(claimed);
         }
-        containerManager.stopAndRemove(entry.containerId(), null);
+        containerManager.stopAndRemove(containerId, null);
+        if (ContainerStorageHelper.shouldPruneVolume(config)) {
+            containerManager.removeVolume(volumeName(entry.serverName()));
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -197,13 +252,20 @@ public class PostgresServerManager {
         long deadline = System.currentTimeMillis() + (long) timeoutSeconds * 1000;
 
         // Phase 1 — wait for the port to accept TCP connections
+        boolean connected = false;
         while (System.currentTimeMillis() < deadline) {
             try (Socket s = new Socket(host, port)) {
                 LOG.infof("PostgreSQL TCP %s:%d is open — waiting for engine init…", host, port);
+                connected = true;
                 break;
             } catch (Exception e) {
                 sleep(1000);
             }
+        }
+
+        if (!connected) {
+            throw new IllegalStateException("PostgreSQL on " + host + ":" + port
+                + " did not accept connections within " + timeoutSeconds + "s");
         }
 
         // Phase 2 — give the engine a moment to finish startup after the port opens.
@@ -226,12 +288,22 @@ public class PostgresServerManager {
         return ContainerStorageHelper.dockerName(config, "pg-" + serverName.toLowerCase().replaceAll("[^a-z0-9-]", "-"));
     }
 
+    private String volumeName(String serverName) {
+        return ContainerStorageHelper.dockerName(config, "pg-data-" + serverName.toLowerCase().replaceAll("[^a-z0-9-]", "-"));
+    }
+
     @PreDestroy
     void shutdown() {
+        if (!"memory".equals(config.storage().mode())) {
+            // Persistent server metadata will be restored on the next startup. Keep the
+            // sidecars and their data intact so recovery can adopt them by name.
+            return;
+        }
         for (Map.Entry<String, String> e : managedContainers.entrySet()) {
             try {
                 LOG.infof("Stopping PostgreSQL container on shutdown: %s", e.getValue());
                 containerManager.stopAndRemove(e.getKey(), null);
+                containerManager.removeVolume(volumeName(e.getValue()));
             } catch (Exception ex) {
                 LOG.warnf(ex, "Error stopping PostgreSQL container %s", e.getValue());
             }

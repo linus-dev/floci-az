@@ -3,22 +3,37 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.native
+    image: floci-az:local
     ports:
       - "4577:4577"
     volumes:
-      - ./data:/app/data
+      # Reuse the state created by the former floci-ui Compose service.
+      - type: bind
+        source: ${FLOCI_AZ_DATA_DIR:-../floci-ui/data/floci-az}
+        target: /app/data
+        bind:
+          create_host_path: false
       - /var/run/docker.sock:/var/run/docker.sock
     tty: true
     environment:
-      FLOCI_AZ_STORAGE_MODE: memory
-      FLOCI_AZ_SERVICES_DOCKER_NETWORK: floci_az_default
+      FLOCI_AZ_STORAGE_MODE: hybrid
+      FLOCI_AZ_STORAGE_PATH: /app/data
+      FLOCI_AZ_SERVICES_DOCKER_NETWORK: floci_default
       FLOCI_AZ_TLS_ENABLED: "true"
-      FLOCI_AZ_HOSTNAME: floci-az
+      FLOCI_AZ_HOSTNAME: ${FLOCI_AZ_HOSTNAME:-192.168.50.170}
+      FLOCI_AZ_SERVICES_POSTGRES_ENABLED: "true"
+      FLOCI_AZ_SERVICES_POSTGRES_MOCKED: "false"
+      FLOCI_AZ_SERVICES_POSTGRES_IMAGE: ${FLOCI_AZ_POSTGRES_IMAGE:-imresamu/postgis-arm64:18-3.6-alpine}
+      FLOCI_AZ_SERVICES_POSTGRES_DEFAULT_PORT: "5432"
+      FLOCI_AZ_SERVICES_POSTGRES_STARTUP_TIMEOUT_SECONDS: "60"
+    restart: unless-stopped
     networks:
-      floci_az_default:
+      floci_default:
         aliases:
           - floci-az
 
 networks:
-  floci_az_default:
-    name: floci_az_default
+  floci_default:
+    name: floci_default
+    # Shared with the floci-ui Compose project and any existing PostgreSQL sidecars.
+    external: true

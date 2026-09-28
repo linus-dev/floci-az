@@ -309,7 +309,7 @@ public class PostgresHandler implements AzureServiceHandler, Resettable, Resourc
                 }
             }
 
-            // Update existing server metadata in place — do NOT restart the container.
+            // Update existing server metadata in place; recover a persisted sidecar if needed.
             PostgresState.ServerEntry existing = state.getServer(serverName).get();
             String password = props.path("administratorLoginPassword").asText("");
             String version  = props.path("version").asText(existing.version());
@@ -327,6 +327,9 @@ public class PostgresHandler implements AzureServiceHandler, Resettable, Resourc
                 existing.databases(), existing.firewallRules(), existing.configurations(),
                 existing.createdAt());
             state.putServer(updated);
+            if (!config.services().postgres().mocked()) {
+                updated = ensureStarted(updated);
+            }
             return accepted(request, updated.armId(), serverResponse(updated));
 
         } catch (Exception e) {
@@ -335,9 +338,47 @@ public class PostgresHandler implements AzureServiceHandler, Resettable, Resourc
         }
     }
 
+    private PostgresState.ServerEntry ensureStarted(PostgresState.ServerEntry entry) {
+        if (entry.containerId() != null) {
+            return entry;
+        }
+        Object lock = startLocks.computeIfAbsent(entry.serverName().toLowerCase(), k -> new Object());
+        synchronized (lock) {
+            PostgresState.ServerEntry current = state.getServer(entry.serverName())
+                .orElseThrow(() -> new IllegalStateException("PostgreSQL server was deleted during recovery"));
+            if (!current.createdAt().equals(entry.createdAt())) {
+                throw new IllegalStateException("PostgreSQL server was replaced during recovery");
+            }
+            if (current.containerId() != null) {
+                return current;
+            }
+            PostgresState.ServerEntry recovered = serverManager.recoverServer(current);
+            Optional<PostgresState.ServerEntry> attached = state.attachContainer(recovered);
+            if (attached.isPresent()) {
+                return attached.get();
+            }
+            // The resource was deleted while recovery ran. The delete path no longer has a
+            // container ID to stop, so finish cleanup here.
+            stopQuietly(recovered);
+            throw new IllegalStateException("PostgreSQL server was deleted during recovery");
+        }
+    }
+
+    private PostgresState.ServerEntry rehydrateBestEffort(PostgresState.ServerEntry entry) {
+        if (config.services().postgres().mocked() || entry.containerId() != null) {
+            return entry;
+        }
+        try {
+            return ensureStarted(entry);
+        } catch (Exception e) {
+            LOG.warnf(e, "Recovery failed for PostgreSQL server %s", entry.serverName());
+            return entry;
+        }
+    }
+
     private Response getServer(String serverName) {
         return state.getServer(serverName)
-            .map(s -> Response.ok(serverResponse(s)).build())
+            .map(s -> Response.ok(serverResponse(rehydrateBestEffort(s))).build())
             .orElse(notFound("Server '" + serverName + "' not found"));
     }
 
@@ -357,7 +398,10 @@ public class PostgresHandler implements AzureServiceHandler, Resettable, Resourc
         List<PostgresState.ServerEntry> servers = rg.equals("default")
             ? state.listServersBySubscription(sub)
             : state.listServersByResourceGroup(sub, rg);
-        List<Map<String, Object>> value = servers.stream().map(this::serverResponse).toList();
+        List<Map<String, Object>> value = servers.stream()
+            .map(this::rehydrateBestEffort)
+            .map(this::serverResponse)
+            .toList();
         return Response.ok(Map.of("value", value)).build();
     }
 
@@ -511,22 +555,31 @@ public class PostgresHandler implements AzureServiceHandler, Resettable, Resourc
     // ── Convenience /connect ──────────────────────────────────────────────────
 
     private Response handleServerConnect(String serverName) {
-        return state.getServer(serverName)
-            .map(s -> {
-                PostgresConnectionInfo info = PostgresConnectionInfo.of(
-                    s.fullyQualifiedDomainName(), s.hostPort(),
-                    s.administratorLogin(), s.administratorLoginPassword(), null);
-                Map<String, Object> resp = new LinkedHashMap<>();
-                resp.put("server", s.serverName());
-                resp.put("host", info.host());
-                resp.put("port", info.port());
-                resp.put("jdbcUrl", info.jdbcUrl());
-                resp.put("uri", info.uri());
-                resp.put("psql", info.psql());
-                resp.put("dotNet", info.dotNet());
-                return Response.ok(resp).build();
-            })
-            .orElse(notFound("Server '" + serverName + "' not found"));
+        Optional<PostgresState.ServerEntry> found = state.getServer(serverName);
+        if (found.isEmpty()) {
+            return notFound("Server '" + serverName + "' not found");
+        }
+        PostgresState.ServerEntry server = found.get();
+        if (!config.services().postgres().mocked()) {
+            try {
+                server = ensureStarted(server);
+            } catch (Exception e) {
+                LOG.errorf(e, "Failed to recover PostgreSQL container for server=%s", serverName);
+                return ArmErrors.error(500, "ContainerRecoveryFailed", String.valueOf(e.getMessage()));
+            }
+        }
+        PostgresConnectionInfo info = PostgresConnectionInfo.of(
+            server.fullyQualifiedDomainName(), server.hostPort(),
+            server.administratorLogin(), server.administratorLoginPassword(), null);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("server", server.serverName());
+        resp.put("host", info.host());
+        resp.put("port", info.port());
+        resp.put("jdbcUrl", info.jdbcUrl());
+        resp.put("uri", info.uri());
+        resp.put("psql", info.psql());
+        resp.put("dotNet", info.dotNet());
+        return Response.ok(resp).build();
     }
 
     // ── Response builders ─────────────────────────────────────────────────────
