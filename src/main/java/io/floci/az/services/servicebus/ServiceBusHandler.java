@@ -74,6 +74,8 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     private static final String ATOM_XML_CONTENT_TYPE = "application/atom+xml;charset=utf-8";
     private static final String XML_PROLOG = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
     private static final String DEFAULT_NAMESPACE = ServiceBusNamespaceManager.DEFAULT_NAMESPACE;
+    private static final String DEFAULT_ACCOUNT = "devstoreaccount1";
+    private static final String NAMESPACE_OWNER_PREFIX = "_system/servicebus/namespace-owner/";
     /** Main Service Bus namespace for entity descriptions. */
     private static final String SB_NS = "http://schemas.microsoft.com/netservices/2010/10/servicebus/connect";
     /** Separate namespace used by CountDetails child elements (per spec). */
@@ -139,7 +141,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
         // ── Custom namespace management ───────────────────────────────────────
         if ("namespaces".equals(path)) {
-            return handleListNamespaces();
+            return handleListNamespaces(account);
         }
         if (path.startsWith("namespaces/")) {
             String rest = path.substring("namespaces/".length());
@@ -185,7 +187,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     // ── Spec: namespace info ──────────────────────────────────────────────────
 
     private Response handleNamespaceInfo(String account) {
-        Optional<String> activeNs = resolveActiveNamespace();
+        Optional<String> activeNs = resolveActiveNamespace(account);
         String now = ISO8601.format(Instant.now());
         String nsName = activeNs.orElse(account);
         String xml = "<entry xmlns=\"http://www.w3.org/2005/Atom\">"
@@ -208,7 +210,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     // ── Spec: list resources (queues or topics) ───────────────────────────────
 
     private Response handleListResources(String account, String entityType) {
-        String ns = resolveActiveNamespace().orElse(null);
+        String ns = resolveActiveNamespace(account).orElse(null);
         if (ns == null) {
             return emptyFeed(entityType);
         }
@@ -234,7 +236,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     // ── Spec: entity CRUD (queue or topic by body) ────────────────────────────
 
     private Response handleSpecEntityCrud(AzureRequest req, String account, String entityName) {
-        String ns = resolveActiveNamespace().orElse(null);
+        String ns = resolveActiveNamespace(account).orElse(null);
         if (ns == null) {
             return Response.status(503)
                     .entity("{\"error\":\"No Service Bus namespace is running\"}")
@@ -306,7 +308,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
     private Response handleSpecSubscriptionPath(AzureRequest req, String account,
                                                   String topicName, String subRest) {
-        String ns = resolveActiveNamespace().orElse(null);
+        String ns = resolveActiveNamespace(account).orElse(null);
         if (ns == null) {
             return notFoundAtom("No running namespace for subscriptions");
         }
@@ -345,11 +347,12 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
     // ── Namespace management ──────────────────────────────────────────────────
 
-    private Response handleListNamespaces() {
+    private Response handleListNamespaces(String account) {
         StringBuilder sb = new StringBuilder("{\"namespaces\":[");
         boolean first = true;
         for (Map.Entry<String, ServiceBusNamespaceManager.NamespaceState> e :
                 namespaceManager.listNamespaces().entrySet()) {
+            if (!namespaceOwnedBy(e.getKey(), account)) continue;
             if (!first) sb.append(",");
             first = false;
             appendNamespaceJson(sb, e.getKey(), e.getValue());
@@ -360,15 +363,18 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
     private Response handleNamespace(AzureRequest req, String namespaceName) {
         return switch (req.method()) {
-            case "GET"          -> handleGetNamespace(namespaceName);
+            case "GET"          -> handleGetNamespace(req.accountName(), namespaceName);
             case "PUT", "POST"  -> handleCreateNamespace(req, namespaceName);
-            case "DELETE"       -> handleDeleteNamespace(namespaceName);
+            case "DELETE"       -> handleDeleteNamespace(req.accountName(), namespaceName);
             default             -> Response.status(405).entity("{\"error\":\"Method not allowed\"}")
                                        .type("application/json").build();
         };
     }
 
-    private Response handleGetNamespace(String namespaceName) {
+    private Response handleGetNamespace(String account, String namespaceName) {
+        if (!namespaceOwnedBy(namespaceName, account)) {
+            return notFound("Namespace not found: " + namespaceName);
+        }
         return namespaceManager.getNamespace(namespaceName)
                 .map(state -> {
                     StringBuilder sb = new StringBuilder();
@@ -379,9 +385,16 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     }
 
     private Response handleCreateNamespace(AzureRequest req, String namespaceName) {
+        String account = req.accountName();
         Optional<ServiceBusNamespaceManager.NamespaceState> existing =
                 namespaceManager.getNamespace(namespaceName);
         if (existing.isPresent()) {
+            if (!namespaceOwnedBy(namespaceName, account)) {
+                return Response.status(409)
+                        .entity("{\"error\":{\"code\":\"NamespaceNameInUse\","
+                                + "\"message\":\"Namespace name is already in use\"}}")
+                        .type("application/json").build();
+            }
             StringBuilder sb = new StringBuilder();
             appendNamespaceJson(sb, namespaceName, existing.get());
             return Response.ok(sb.toString()).type("application/json").build();
@@ -390,6 +403,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
         if (config.services().serviceBus().mocked()) {
             ServiceBusNamespaceManager.NamespaceState state =
                     namespaceManager.startMockedNamespace(namespaceName);
+            storeNamespaceOwner(namespaceName, account);
             StringBuilder json = new StringBuilder();
             appendNamespaceJson(json, namespaceName, state);
             return Response.status(201).entity(json.toString()).type("application/json").build();
@@ -413,6 +427,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
         try {
             ServiceBusNamespaceManager.NamespaceState state =
                     namespaceManager.startNamespace(namespaceName, amqpPort, amqpTlsPort);
+            storeNamespaceOwner(namespaceName, account);
             StringBuilder json = new StringBuilder();
             appendNamespaceJson(json, namespaceName, state);
             return Response.status(201).entity(json.toString()).type("application/json").build();
@@ -424,11 +439,15 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
         }
     }
 
-    private Response handleDeleteNamespace(String namespaceName) {
+    private Response handleDeleteNamespace(String account, String namespaceName) {
+        if (!namespaceOwnedBy(namespaceName, account)) {
+            return notFound("Namespace not found: " + namespaceName);
+        }
         boolean stopped = namespaceManager.stopNamespace(namespaceName);
         if (!stopped) {
             return notFound("Namespace not found: " + namespaceName);
         }
+        store.delete(namespaceOwnerKey(namespaceName));
         return Response.noContent().build();
     }
 
@@ -436,6 +455,9 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
     private Response routeEntityRequest(AzureRequest req, String account,
                                          String namespace, String entityPath) {
+        if (namespaceManager.getNamespace(namespace).isPresent() && !namespaceOwnedBy(namespace, account)) {
+            return notFound("Namespace not found: " + namespace);
+        }
         if ("queues".equals(entityPath)) {
             return handleListQueues(account, namespace);
         }
@@ -523,7 +545,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
         }
 
         if (namespaceManager.getNamespace(namespace).isEmpty()) {
-            lazyStartNamespace(namespace);
+            lazyStartNamespace(account, namespace);
         }
         EmulatorConfig.ServiceBusConfig sb = config.services().serviceBus();
         ServiceBusModels.QueueEntity queue = ServiceBusModels.QueueEntity.defaults(
@@ -610,7 +632,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
         }
 
         if (namespaceManager.getNamespace(namespace).isEmpty()) {
-            lazyStartNamespace(namespace);
+            lazyStartNamespace(account, namespace);
         }
         ServiceBusModels.TopicEntity topic =
                 ServiceBusModels.TopicEntity.defaults(topicName, duplicateDetection, lifetime);
@@ -1282,25 +1304,48 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
      * Returns the first running namespace for this account (if any).
      * In practice there will only be one namespace active at a time.
      */
-    private Optional<String> resolveActiveNamespace() {
-        if (namespaceManager.listNamespaces().isEmpty()) {
-            lazyStartNamespace(DEFAULT_NAMESPACE);
-        }
-        return namespaceManager.listNamespaces().keySet().stream().findFirst();
+    private Optional<String> resolveActiveNamespace(String account) {
+        Optional<String> active = namespaceManager.listNamespaces().keySet().stream()
+                .filter(name -> namespaceOwnedBy(name, account))
+                .findFirst();
+        if (active.isPresent()) return active;
+        lazyStartNamespace(account, DEFAULT_NAMESPACE);
+        return namespaceManager.listNamespaces().keySet().stream()
+                .filter(name -> namespaceOwnedBy(name, account))
+                .findFirst();
     }
 
-    private synchronized void lazyStartNamespace(String name) {
+    private synchronized void lazyStartNamespace(String account, String name) {
         if (namespaceManager.getNamespace(name).isPresent()) return;
         EmulatorConfig.ServiceBusConfig sb = config.services().serviceBus();
         if (sb.mocked()) {
             namespaceManager.startMockedNamespace(name);
+            storeNamespaceOwner(name, account);
             return;
         }
         try {
             namespaceManager.startNamespace(name, sb.amqpPort(), sb.amqpTlsPort());
+            storeNamespaceOwner(name, account);
         } catch (Exception e) {
             LOG.errorf(e, "Failed to lazily start Service Bus namespace '%s'", name);
         }
+    }
+
+    private boolean namespaceOwnedBy(String namespace, String account) {
+        String owner = store.get(namespaceOwnerKey(namespace))
+                .map(object -> new String(object.data(), StandardCharsets.UTF_8))
+                .orElse(DEFAULT_ACCOUNT);
+        return owner.equalsIgnoreCase(account);
+    }
+
+    private void storeNamespaceOwner(String namespace, String account) {
+        String key = namespaceOwnerKey(namespace);
+        store.put(key, new StoredObject(key, account.getBytes(StandardCharsets.UTF_8),
+                Map.of(), Instant.now(), key));
+    }
+
+    private static String namespaceOwnerKey(String namespace) {
+        return NAMESPACE_OWNER_PREFIX + namespace.toLowerCase();
     }
 
     private static void appendNamespaceJson(StringBuilder sb, String name,

@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.UUID;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -13,10 +15,31 @@ import static org.hamcrest.Matchers.not;
 public class ServiceBusServiceTest {
 
     private static final String BASE = "/devstoreaccount1-servicebus";
+    private static final String OTHER_ACCOUNT = "/devstoreaccount1-sub-11111111222233334444555555555555-servicebus";
     private static final String SB_NS =
             "http://schemas.microsoft.com/netservices/2010/10/servicebus/connect";
     private static final String SB_COUNT_NS =
             "http://schemas.microsoft.com/netservices/2011/06/servicebus";
+
+    @Test
+    void namespacesBelongToTheSelectedAccount() {
+        String namespace = "subscription-scope-" + UUID.randomUUID().toString().substring(0, 8);
+
+        given().body("{}").when().put(BASE + "/namespaces/" + namespace)
+                .then().statusCode(201);
+        given().when().get(BASE + "/namespaces")
+                .then().statusCode(200).body(containsString(namespace));
+        given().when().get(OTHER_ACCOUNT + "/namespaces")
+                .then().statusCode(200).body(not(containsString(namespace)));
+        given().when().get(OTHER_ACCOUNT + "/namespaces/" + namespace)
+                .then().statusCode(404);
+        given().body("{}").when().put(OTHER_ACCOUNT + "/namespaces/" + namespace)
+                .then().statusCode(409);
+        given().when().delete(OTHER_ACCOUNT + "/namespaces/" + namespace)
+                .then().statusCode(404);
+        given().when().delete(BASE + "/namespaces/" + namespace)
+                .then().statusCode(204);
+    }
 
     @Test
     void testExistingPathRouting() {

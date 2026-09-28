@@ -335,7 +335,7 @@ flowchart LR
 | **Cosmos DB NoSQL (embedded)** | `/{account}-cosmos-nosql/` | Same embedded SQL engine as above, exposed as a named engine endpoint. Opt-in with `FLOCI_AZ_SERVICES_COSMOS_ENGINES_NOSQL_ENABLED=true`; no Docker required. |
 | **Key Vault**           | `/{account}-keyvault/`       | Self-signed certificates with PFX/PEM secrets; Secrets CRUD, versioning, soft-delete, properties update; Keys CRUD, backup/restore, rotation, RSA/EC/oct crypto (encrypt/decrypt/sign/verify/wrap/unwrap), `/rng`; Managed HSM (`/{account}-managedhsm/`) |
 | **Event Hubs**          | AMQP `:5672` / Kafka `:9093` | AMQP 1.0 (Artemis sidecar), Kafka-compatible (Redpanda, opt-in)                                                                                                                                                       |
-| **Service Bus**         | `/{account}-servicebus/` + AMQP `:5673` | Queues, topics, subscriptions (created dynamically); AMQP 1.0 data plane via Artemis sidecar, or mocked (management plane only)                                                                             |
+| **Service Bus**         | `/{account}-servicebus/` + AMQP `:5673` | Queues, topics, subscriptions (created dynamically); AMQP 1.0 data plane via Artemis sidecar, or mocked (management plane only). Namespace management lists only namespaces owned by the path's account; namespace names remain globally unique. |
 | **Azure SQL Database**  | ARM path + `/{account}-sql/` | Servers, databases, firewall rules; ARM-only by default, optional managed SQL Server 2025 containers                                                                                                                 |
 | **Azure Database for PostgreSQL** | ARM path (`Microsoft.DBforPostgreSQL`) + `/{account}-postgres/` | Flexible servers, databases, firewall rules, configurations; Docker-backed `postgres:17-alpine` containers (no EULA), dynamic port allocation, or mocked |
 | **Azure Database for MySQL** | ARM path (`Microsoft.DBforMySQL`) + `/{account}-mysql/` | Flexible servers, databases, firewall rules, configurations; Docker-backed `mysql:8.0` containers (no EULA), dynamic port allocation, or mocked |
@@ -352,6 +352,10 @@ flowchart LR
 | **Azure Monitor / Log Analytics** | ARM path (`Microsoft.OperationalInsights` / `Microsoft.Insights`) + `/dataCollectionRules/{id}/streams/{stream}` + `/v1/workspaces/{id}/query` | Workspaces, Data Collection Endpoints/Rules; Logs Ingestion API; Log Analytics query with a KQL subset (`where`/`project`/`take`/`limit` + timespan); HTTP-only (no sidecar) |
 | **Communication Services Email** | `/emails:send` + `/emails/operations/{id}` + `/emailMessages` + ARM path (`Microsoft.Communication`) | ACS Email send + status polling; in-memory inspection mailbox (Mailpit-style `GET /emailMessages`); communication/email services + domains via ARM; captures messages locally, no real delivery; HTTP-only (no sidecar)  |
 | **Managed Identity**    | ARM path (`Microsoft.ManagedIdentity`) + `/metadata/identity/oauth2/token` | User-assigned identities (server-generated `principalId`/`clientId`), federated identity credentials, system-assigned `identities/default`; IMDS token endpoint for `ManagedIdentityCredential` (point the SDK at the emulator with `AZURE_POD_IDENTITY_AUTHORITY_HOST`); v1.0 JWTs signed with the Entra key, verifiable via JWKS; HTTP-only (no sidecar) |
+
+Service Bus namespace ownership is saved in the configured Service Bus storage backend.
+Namespaces created before ownership tracking are assigned to `devstoreaccount1` so
+existing installations retain access to them.
 
 <details>
 <summary><strong>API Management details</strong></summary>
